@@ -13,6 +13,14 @@
 		Tab:CreateToggle({ Name = "Enabled", Callback = function(v) print(v) end })
 
 	Полный пример - в файле Example.lua
+
+	Новое в 1.1:
+		Tab:CreateColorPicker({ Name, Default, Flag, Callback })   -- палитра из 16 цветов
+		Window:CreateConfigTab()                                    -- готовая вкладка конфигов
+		Library:SaveConfig(n) / LoadConfig(n) / DeleteConfig(n) / ListConfigs()
+		Window:CreatePlayersTab({ Actions = {...} })                -- drag & drop функций на игроков
+		Library:SetCursor(id)                                       -- курсор над окном
+		Flag = "имя" у любого элемента - включает его в конфиг
 ]]
 
 local Players = game:GetService("Players")
@@ -20,10 +28,15 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Stats = game:GetService("Stats")
+local HttpService = game:GetService("HttpService")
 
 local Library = {
-	Version = "1.0.0",
+	Version = "1.1.0",
 	Gui = nil,
+	Flags = {},
+	Cursor = "rbxassetid://76753338419764",
+	ConfigFolder = "Nocturne/configs",
+	_windows = {},
 	Theme = {
 		Background = Color3.fromRGB(11, 11, 15),
 		Surface = Color3.fromRGB(17, 17, 23),
@@ -134,6 +147,14 @@ local function isMove(input)
 		or input.UserInputType == Enum.UserInputType.Touch
 end
 
+local LocalPlayer = Players.LocalPlayer
+
+-- находится ли точка (Vector2) внутри GuiObject
+local function inside(obj, p)
+	local pos, size = obj.AbsolutePosition, obj.AbsoluteSize
+	return p.X >= pos.X and p.X <= pos.X + size.X and p.Y >= pos.Y and p.Y <= pos.Y + size.Y
+end
+
 local function makeDraggable(handle, target, uiScale)
 	local dragging = false
 	local dragStart, startPos
@@ -229,6 +250,275 @@ function Library:SetTheme(tbl)
 	for k, v in pairs(tbl) do
 		self.Theme[k] = v
 	end
+end
+
+---------------------------------------------------------------------
+-- ПАЛИТРА ДЛЯ COLORPICKER (16 цветов)
+---------------------------------------------------------------------
+Library.Palette = {
+	Color3.fromRGB(255, 77, 77),   -- red
+	Color3.fromRGB(255, 140, 66),  -- orange
+	Color3.fromRGB(255, 200, 87),  -- amber
+	Color3.fromRGB(250, 230, 90),  -- yellow
+	Color3.fromRGB(170, 230, 80),  -- lime
+	Color3.fromRGB(80, 220, 140),  -- green
+	Color3.fromRGB(92, 255, 196),  -- mint
+	Color3.fromRGB(40, 200, 190),  -- teal
+	Color3.fromRGB(79, 216, 255),  -- cyan
+	Color3.fromRGB(90, 160, 255),  -- sky
+	Color3.fromRGB(66, 110, 255),  -- blue
+	Color3.fromRGB(139, 92, 255),  -- violet
+	Color3.fromRGB(190, 90, 255),  -- purple
+	Color3.fromRGB(240, 80, 220),  -- magenta
+	Color3.fromRGB(255, 95, 162),  -- pink
+	Color3.fromRGB(245, 245, 250), -- white
+}
+
+---------------------------------------------------------------------
+-- КУРСОР: меняется, пока мышь над окном библиотеки
+---------------------------------------------------------------------
+local cursorState = { active = false, previous = "" }
+
+local function restoreCursor()
+	if cursorState.active then
+		cursorState.active = false
+		pcall(function()
+			UserInputService.MouseIcon = cursorState.previous or ""
+		end)
+	end
+end
+
+local function startCursor()
+	if Library._cursorStarted then
+		return
+	end
+	Library._cursorStarted = true
+
+	connect(RunService.RenderStepped, function()
+		local want = false
+		if Library.Cursor then
+			local m = UserInputService:GetMouseLocation()
+			for _, w in ipairs(Library._windows) do
+				local r = w.Root
+				if r.Parent and r.Visible and inside(r, m) then
+					want = true
+					break
+				end
+			end
+		end
+
+		if want then
+			if not cursorState.active then
+				cursorState.active = true
+				cursorState.previous = UserInputService.MouseIcon
+			end
+			if UserInputService.MouseIcon ~= Library.Cursor then
+				UserInputService.MouseIcon = Library.Cursor
+			end
+		else
+			restoreCursor()
+		end
+	end)
+end
+
+-- Library:SetCursor(76753338419764) / Library:SetCursor("rbxassetid://...") / Library:SetCursor(nil) - выключить
+function Library:SetCursor(id)
+	if type(id) == "number" then
+		id = "rbxassetid://" .. id
+	end
+	self.Cursor = id
+end
+
+---------------------------------------------------------------------
+-- КОНФИГИ
+-- Любой элемент с параметром Flag = "имя" попадает в конфиг.
+-- Файлы: <workspace>/Nocturne/configs/<имя>.json (если есть writefile/readfile),
+-- иначе конфиги живут в памяти до выхода из игры.
+---------------------------------------------------------------------
+local memoryConfigs = {}
+
+local function hasFs()
+	return type(writefile) == "function" and type(readfile) == "function"
+end
+
+local function ensureFolder()
+	if type(makefolder) ~= "function" or type(isfolder) ~= "function" then
+		return
+	end
+	pcall(function()
+		local path = ""
+		for part in string.gmatch(Library.ConfigFolder, "[^/]+") do
+			path = (path == "") and part or (path .. "/" .. part)
+			if not isfolder(path) then
+				makefolder(path)
+			end
+		end
+	end)
+end
+
+local function cleanName(name)
+	local s = tostring(name or "")
+	s = s:gsub("[^%w%-_ ]", "")
+	s = s:gsub("^%s+", "")
+	s = s:gsub("%s+$", "")
+	return s
+end
+
+local function serialize(v)
+	local t = typeof(v)
+	if t == "Color3" then
+		return {
+			__t = "Color3",
+			r = math.floor(v.R * 255 + 0.5),
+			g = math.floor(v.G * 255 + 0.5),
+			b = math.floor(v.B * 255 + 0.5),
+		}
+	elseif t == "EnumItem" then
+		return { __t = "Enum", name = tostring(v) }
+	elseif t == "nil" then
+		return { __t = "nil" }
+	end
+	return v
+end
+
+local function deserialize(v)
+	if type(v) == "table" then
+		if v.__t == "Color3" then
+			return Color3.fromRGB(v.r, v.g, v.b)
+		elseif v.__t == "Enum" then
+			local parts = string.split(v.name, ".")
+			local ok, item = pcall(function()
+				return Enum[parts[2]][parts[3]]
+			end)
+			return ok and item or nil
+		end
+		return nil
+	end
+	return v
+end
+
+local function configPath(name)
+	return Library.ConfigFolder .. "/" .. name .. ".json"
+end
+
+function Library:GetConfigData()
+	local data = {}
+	for flag, api in pairs(self.Flags) do
+		local ok, value = pcall(function()
+			return api:Get()
+		end)
+		if ok then
+			data[flag] = serialize(value)
+		end
+	end
+	return data
+end
+
+function Library:ApplyConfigData(data)
+	for flag, raw in pairs(data) do
+		local api = self.Flags[flag]
+		if api then
+			pcall(function()
+				api:Set(deserialize(raw))
+			end)
+		end
+	end
+end
+
+-- возвращает: ok (bool), имя или текст ошибки
+function Library:SaveConfig(name)
+	name = cleanName(name)
+	if name == "" then
+		return false, "Enter a config name"
+	end
+	local ok, json = pcall(function()
+		return HttpService:JSONEncode(self:GetConfigData())
+	end)
+	if not ok then
+		return false, "Could not encode config"
+	end
+	if hasFs() then
+		ensureFolder()
+		local wrote, err = pcall(writefile, configPath(name), json)
+		if not wrote then
+			return false, tostring(err)
+		end
+	else
+		memoryConfigs[name] = json
+	end
+	return true, name
+end
+
+function Library:LoadConfig(name)
+	name = cleanName(name)
+	if name == "" then
+		return false, "Enter a config name"
+	end
+	local json
+	if hasFs() then
+		local ok, res = pcall(readfile, configPath(name))
+		if not ok then
+			return false, "Config not found"
+		end
+		json = res
+	else
+		json = memoryConfigs[name]
+		if not json then
+			return false, "Config not found"
+		end
+	end
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(json)
+	end)
+	if not ok or type(data) ~= "table" then
+		return false, "Config file is damaged"
+	end
+	self:ApplyConfigData(data)
+	return true, name
+end
+
+function Library:DeleteConfig(name)
+	name = cleanName(name)
+	if name == "" then
+		return false, "Enter a config name"
+	end
+	if hasFs() then
+		if type(delfile) ~= "function" then
+			return false, "delfile is not available"
+		end
+		local ok = pcall(delfile, configPath(name))
+		if ok then
+			return true, name
+		end
+		return false, "Config not found"
+	end
+	if memoryConfigs[name] then
+		memoryConfigs[name] = nil
+		return true, name
+	end
+	return false, "Config not found"
+end
+
+function Library:ListConfigs()
+	local names = {}
+	if hasFs() and type(listfiles) == "function" then
+		ensureFolder()
+		local ok, files = pcall(listfiles, self.ConfigFolder)
+		if ok and type(files) == "table" then
+			for _, path in ipairs(files) do
+				local n = tostring(path):match("([^/\\]+)%.json$")
+				if n then
+					table.insert(names, n)
+				end
+			end
+		end
+	else
+		for n in pairs(memoryConfigs) do
+			table.insert(names, n)
+		end
+	end
+	table.sort(names)
+	return names
 end
 
 ---------------------------------------------------------------------
@@ -419,6 +709,9 @@ function Library:CreateWindow(o)
 		Size = UDim2.fromOffset(size.X, size.Y),
 		BackgroundTransparency = 1,
 	}, gui)
+
+	table.insert(self._windows, { Root = root })
+	startCursor()
 
 	local uiScale = create("UIScale", {}, root)
 	local function fit()
@@ -731,6 +1024,14 @@ function Library:CreateWindow(o)
 			})
 		end
 
+		-- элемент с Flag = "имя" попадает в конфиги
+		local function reg(opts, api)
+			if opts and opts.Flag then
+				Library.Flags[opts.Flag] = api
+			end
+			return api
+		end
+
 		-----------------------------------------------------------
 		-- Section
 		-----------------------------------------------------------
@@ -834,7 +1135,7 @@ function Library:CreateWindow(o)
 			c.MouseButton1Click:Connect(function()
 				api:Set(not state)
 			end)
-			return api
+			return reg(opts, api)
 		end
 
 		-----------------------------------------------------------
@@ -938,7 +1239,7 @@ function Library:CreateWindow(o)
 				end
 			end)
 
-			return api
+			return reg(opts, api)
 		end
 
 		-----------------------------------------------------------
@@ -1081,7 +1382,7 @@ function Library:CreateWindow(o)
 			end)
 
 			build()
-			return api
+			return reg(opts, api)
 		end
 
 		-----------------------------------------------------------
@@ -1126,12 +1427,12 @@ function Library:CreateWindow(o)
 
 			local api = {}
 			function api:Set(s)
-				box.Text = s
+				box.Text = tostring(s or "")
 			end
 			function api:Get()
 				return box.Text
 			end
-			return api
+			return reg(opts, api)
 		end
 
 		-----------------------------------------------------------
@@ -1201,10 +1502,502 @@ function Library:CreateWindow(o)
 			function api:Get()
 				return key
 			end
-			return api
+			return reg(opts, api)
+		end
+
+		-----------------------------------------------------------
+		-- ColorPicker (палитра из 16 цветов)
+		-----------------------------------------------------------
+		--[[ Tab:CreateColorPicker({ Name, Default = Color3, Flag, Callback = function(color) end })
+		     -> :Set(Color3) :Get() ]]
+		function Tab:CreateColorPicker(opts)
+			opts = opts or {}
+			local palette = Library.Palette
+			local color = opts.Default or palette[12]
+			local open = false
+
+			local c = card(38, false)
+			c.ClipsDescendants = true
+
+			local header = create("TextButton", {
+				Size = UDim2.new(1, 0, 0, 38),
+				BackgroundTransparency = 1,
+				Text = "",
+				AutoButtonColor = false,
+			}, c)
+			nameLabel(header, opts.Name or "Color", 0.6)
+
+			local preview = create("Frame", {
+				AnchorPoint = Vector2.new(1, 0.5),
+				Position = UDim2.new(1, -14, 0.5, 0),
+				Size = UDim2.fromOffset(34, 20),
+				BackgroundColor3 = color,
+			}, header)
+			round(preview, 6)
+			stroke(preview, T.Stroke, 1)
+
+			-- сетка 8 x 2
+			local grid = create("Frame", {
+				Position = UDim2.fromOffset(14, 46),
+				Size = UDim2.new(1, -28, 0, 60),
+				BackgroundTransparency = 1,
+			}, c)
+			create("UIGridLayout", {
+				CellSize = UDim2.fromOffset(24, 24),
+				CellPadding = UDim2.fromOffset(8, 8),
+				SortOrder = Enum.SortOrder.LayoutOrder,
+			}, grid)
+
+			local swatches = {}
+			local api = {}
+
+			local function sameColor(a, b)
+				return math.abs(a.R - b.R) < 0.005 and math.abs(a.G - b.G) < 0.005 and math.abs(a.B - b.B) < 0.005
+			end
+
+			local function mark()
+				preview.BackgroundColor3 = color
+				for _, s in ipairs(swatches) do
+					local on = sameColor(s.color, color)
+					tween(s.stroke, 0.15, { Transparency = on and 0 or 1 })
+				end
+			end
+
+			for i, col in ipairs(palette) do
+				local s = create("TextButton", {
+					Text = "",
+					AutoButtonColor = false,
+					BackgroundColor3 = col,
+					LayoutOrder = i,
+				}, grid)
+				round(s, 6)
+				local st = stroke(s, T.Text, 2, 1)
+				swatches[i] = { color = col, stroke = st }
+				s.MouseButton1Click:Connect(function()
+					api:Set(col)
+				end)
+			end
+
+			local function setOpen(state)
+				open = state
+				tween(c, 0.25, { Size = UDim2.new(1, 0, 0, open and 118 or 38) })
+			end
+
+			function api:Set(col, silent)
+				if typeof(col) ~= "Color3" then
+					return
+				end
+				color = col
+				mark()
+				if not silent then
+					fire(opts.Callback, color)
+				end
+			end
+			function api:Get()
+				return color
+			end
+
+			header.MouseEnter:Connect(function()
+				tween(c, 0.15, { BackgroundColor3 = T.ElementHover })
+			end)
+			header.MouseLeave:Connect(function()
+				tween(c, 0.15, { BackgroundColor3 = T.Element })
+			end)
+			header.MouseButton1Click:Connect(function()
+				setOpen(not open)
+			end)
+
+			mark()
+			return reg(opts, api)
 		end
 
 		return Tab
+	end
+
+	---------------------------------------------------------------
+	-- ВКЛАДКА КОНФИГОВ
+	---------------------------------------------------------------
+	--[[ Window:CreateConfigTab("Configs", "💾")
+	     Готовая вкладка: имя, список сохранённых, Save / Load / Delete / Refresh.
+	     В конфиг попадают элементы, у которых задан Flag = "имя". ]]
+	function Window:CreateConfigTab(name, icon)
+		local Tab = Window:CreateTab(name or "Configs", icon or "💾")
+
+		Tab:CreateSection("Config")
+
+		local nameBox = Tab:CreateTextbox({ Name = "Config name", Placeholder = "my config" })
+		local list
+		list = Tab:CreateDropdown({
+			Name = "Saved configs",
+			Options = Library:ListConfigs(),
+			Callback = function(opt)
+				nameBox:Set(opt)
+			end,
+		})
+
+		local function refresh()
+			list:Refresh(Library:ListConfigs())
+		end
+		local function target()
+			local n = nameBox:Get()
+			if n == "" then
+				n = list:Get() or ""
+			end
+			return n
+		end
+		local function report(ok, res, okTitle)
+			Library:Notify({
+				Title = ok and okTitle or "Config error",
+				Content = tostring(res),
+				Type = ok and "success" or "error",
+			})
+		end
+
+		Tab:CreateButton({
+			Name = "Save",
+			Callback = function()
+				local ok, res = Library:SaveConfig(target())
+				report(ok, res, "Config saved")
+				if ok then
+					refresh()
+					list:Set(res, true)
+				end
+			end,
+		})
+		Tab:CreateButton({
+			Name = "Load",
+			Callback = function()
+				local ok, res = Library:LoadConfig(target())
+				report(ok, res, "Config loaded")
+			end,
+		})
+		Tab:CreateButton({
+			Name = "Delete",
+			Callback = function()
+				local ok, res = Library:DeleteConfig(target())
+				report(ok, res, "Config deleted")
+				if ok then
+					refresh()
+					nameBox:Set("")
+				end
+			end,
+		})
+		Tab:CreateButton({
+			Name = "Refresh list",
+			Callback = refresh,
+		})
+
+		Tab:CreateLabel(
+			hasFs() and ("Файлы лежат в папке workspace/" .. Library.ConfigFolder)
+				or "Файловая система недоступна: конфиги живут в памяти до выхода из игры."
+		)
+
+		return Tab
+	end
+
+	---------------------------------------------------------------
+	-- ВКЛАДКА ИГРОКОВ (drag & drop функций)
+	---------------------------------------------------------------
+	--[[ local P = Window:CreatePlayersTab({
+	         Name = "Players", Icon = "👥",
+	         IncludeLocal = true,   -- показывать себя в списке
+	         Actions = {
+	             { Name = "Kill", Icon = "💀", Callback = function(player, actionName) ... end },
+	         },
+	     })
+	     P:AddAction({ Name, Icon, Callback })
+	     Тяни плашку функции на игрока или на арену внизу (арена = на всех). ]]
+	function Window:CreatePlayersTab(o)
+		o = o or {}
+		local GuiService = game:GetService("GuiService")
+		local includeLocal = o.IncludeLocal ~= false
+
+		local Tab = Window:CreateTab(o.Name or "Players", o.Icon or "👥")
+		local page = Tab.Page
+
+		-- эта вкладка рисует свой layout и не скроллится целиком
+		for _, cls in ipairs({ "UIListLayout", "UIPadding" }) do
+			local x = page:FindFirstChildOfClass(cls)
+			if x then
+				x:Destroy()
+			end
+		end
+		page.AutomaticCanvasSize = Enum.AutomaticSize.None
+		page.CanvasSize = UDim2.new()
+		page.ScrollingEnabled = false
+		page.ScrollBarThickness = 0
+
+		local LIST_Y = 106
+		local ARENA_H = 56
+
+		-- верх: функции
+		text(page, "FUNCTIONS  ·  drag onto a player", 12, F.bold, T.Accent, {
+			Position = UDim2.fromOffset(14, 10),
+			Size = UDim2.new(1, -28, 0, 16),
+		})
+		local chips = create("Frame", {
+			Position = UDim2.fromOffset(12, 32),
+			Size = UDim2.new(1, -24, 0, 66),
+			BackgroundTransparency = 1,
+			ClipsDescendants = true,
+		}, page)
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			Wraps = true,
+			Padding = UDim.new(0, 6),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}, chips)
+
+		-- середина: игроки
+		local list = create("ScrollingFrame", {
+			Position = UDim2.fromOffset(12, LIST_Y),
+			Size = UDim2.new(1, -24, 1, -(LIST_Y + ARENA_H + 20)),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 3,
+			ScrollBarImageColor3 = T.Accent,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		}, page)
+		create("UIListLayout", {
+			Padding = UDim.new(0, 6),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}, list)
+
+		-- низ: арена
+		local arena = create("Frame", {
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.new(0, 12, 1, -12),
+			Size = UDim2.new(1, -24, 0, ARENA_H),
+			BackgroundColor3 = T.Surface,
+		}, page)
+		round(arena, 10)
+		local arenaStroke = stroke(arena, T.Stroke, 1.5)
+		text(arena, "⚔  ARENA", 14, F.bold, T.Text, {
+			Position = UDim2.fromOffset(0, 9),
+			Size = UDim2.new(1, 0, 0, 18),
+			TextXAlignment = CENTER,
+		})
+		text(arena, "Drop a function here to apply it to everyone", 12, F.med, T.Muted, {
+			Position = UDim2.fromOffset(0, 29),
+			Size = UDim2.new(1, 0, 0, 16),
+			TextXAlignment = CENTER,
+		})
+
+		local rows = {}
+		local actions = {}
+		local rowOrder = 0
+		local drag = nil
+
+		local function wanted(plr)
+			return includeLocal or plr ~= LocalPlayer
+		end
+
+		local function addRow(plr)
+			if rows[plr] or not wanted(plr) then
+				return
+			end
+			rowOrder = rowOrder + 1
+			local f = create("Frame", {
+				Size = UDim2.new(1, -6, 0, 46),
+				BackgroundColor3 = T.Element,
+				LayoutOrder = rowOrder,
+			}, list)
+			round(f, 8)
+			local st = stroke(f, T.Stroke, 1)
+
+			local av = create("ImageLabel", {
+				Position = UDim2.fromOffset(8, 6),
+				Size = UDim2.fromOffset(34, 34),
+				BackgroundColor3 = T.Background,
+				Image = "rbxthumb://type=AvatarHeadShot&id=" .. plr.UserId .. "&w=150&h=150",
+			}, f)
+			round(av, 17)
+
+			text(f, plr.DisplayName .. (plr == LocalPlayer and "  (you)" or ""), 14, F.bold, T.Text, {
+				Position = UDim2.fromOffset(52, 6),
+				Size = UDim2.new(1, -64, 0, 18),
+			})
+			text(f, "@" .. plr.Name, 12, F.med, T.Muted, {
+				Position = UDim2.fromOffset(52, 25),
+				Size = UDim2.new(1, -64, 0, 16),
+			})
+
+			rows[plr] = { frame = f, stroke = st }
+		end
+
+		local function removeRow(plr)
+			local r = rows[plr]
+			if r then
+				r.frame:Destroy()
+				rows[plr] = nil
+			end
+		end
+
+		for _, plr in ipairs(Players:GetPlayers()) do
+			addRow(plr)
+		end
+		connect(Players.PlayerAdded, addRow)
+		connect(Players.PlayerRemoving, removeRow)
+
+		-- координаты указателя в тех же пикселях, что и AbsolutePosition
+		local function pointer(input)
+			if input.UserInputType == Enum.UserInputType.Touch then
+				return Vector2.new(input.Position.X, input.Position.Y) + GuiService:GetGuiInset()
+			end
+			return UserInputService:GetMouseLocation()
+		end
+
+		local function targetAt(p)
+			if inside(arena, p) then
+				return "arena"
+			end
+			if inside(list, p) then
+				for plr, r in pairs(rows) do
+					if inside(r.frame, p) then
+						return plr
+					end
+				end
+			end
+			return nil
+		end
+
+		local function highlight(t)
+			for plr, r in pairs(rows) do
+				local on = (plr == t)
+				tween(r.stroke, 0.12, { Color = on and T.Accent or T.Stroke })
+				tween(r.frame, 0.12, { BackgroundColor3 = on and T.ElementHover or T.Element })
+			end
+			local on = (t == "arena")
+			tween(arenaStroke, 0.12, { Color = on and T.Accent or T.Stroke })
+			tween(arena, 0.12, { BackgroundColor3 = on and T.ElementHover or T.Surface })
+		end
+
+		local function label(a)
+			return (a.Icon and (a.Icon .. "  ") or "") .. a.Name
+		end
+
+		local function makeGhost(a)
+			local g = create("TextLabel", {
+				Size = UDim2.fromOffset(0, 28),
+				AutomaticSize = Enum.AutomaticSize.X,
+				BackgroundColor3 = T.Accent,
+				BackgroundTransparency = 0.1,
+				Text = label(a),
+				TextColor3 = Color3.new(1, 1, 1),
+				Font = F.bold,
+				TextSize = 13,
+				ZIndex = 1000,
+			}, Library.Gui)
+			round(g, 8)
+			create("UIPadding", {
+				PaddingLeft = UDim.new(0, 12),
+				PaddingRight = UDim.new(0, 12),
+			}, g)
+			return g
+		end
+
+		local function drop(a, t)
+			if t == "arena" then
+				local n = 0
+				for _, plr in ipairs(Players:GetPlayers()) do
+					if wanted(plr) then
+						n = n + 1
+						fire(a.Callback, plr, a.Name)
+					end
+				end
+				Library:Notify({
+					Title = a.Name,
+					Content = "Applied to everyone (" .. n .. ")",
+					Type = "success",
+					Duration = 2.5,
+				})
+			elseif t then
+				fire(a.Callback, t, a.Name)
+				Library:Notify({
+					Title = a.Name,
+					Content = "Applied to " .. t.DisplayName,
+					Type = "success",
+					Duration = 2.5,
+				})
+			end
+		end
+
+		connect(UserInputService.InputChanged, function(input)
+			if not drag or not isMove(input) then
+				return
+			end
+			local p = pointer(input)
+			if not drag.active and (p - drag.start).Magnitude > 6 then
+				drag.active = true
+				drag.ghost = makeGhost(drag.action)
+			end
+			if drag.active then
+				drag.ghost.Position = UDim2.fromOffset(p.X + 14, p.Y + 10)
+				highlight(targetAt(p))
+			end
+		end)
+
+		connect(UserInputService.InputEnded, function(input)
+			if drag and isPress(input) then
+				local d = drag
+				drag = nil
+				if d.ghost then
+					d.ghost:Destroy()
+				end
+				highlight(nil)
+				if d.active then
+					drop(d.action, targetAt(pointer(input)))
+				end
+			end
+		end)
+
+		local api = { Tab = Tab }
+
+		function api:AddAction(a)
+			if type(a) ~= "table" or not a.Name then
+				return
+			end
+			table.insert(actions, a)
+
+			local chip = create("TextButton", {
+				Size = UDim2.fromOffset(0, 30),
+				AutomaticSize = Enum.AutomaticSize.X,
+				BackgroundColor3 = T.Element,
+				Text = "",
+				AutoButtonColor = false,
+				LayoutOrder = #actions,
+			}, chips)
+			round(chip, 8)
+			stroke(chip, T.Stroke, 1)
+			create("UIPadding", {
+				PaddingLeft = UDim.new(0, 12),
+				PaddingRight = UDim.new(0, 12),
+			}, chip)
+			text(chip, label(a), 13, F.med, T.Text, {
+				Size = UDim2.new(0, 0, 1, 0),
+				AutomaticSize = Enum.AutomaticSize.X,
+				TextTruncate = Enum.TextTruncate.None,
+			})
+
+			chip.MouseEnter:Connect(function()
+				tween(chip, 0.12, { BackgroundColor3 = T.ElementHover })
+			end)
+			chip.MouseLeave:Connect(function()
+				tween(chip, 0.12, { BackgroundColor3 = T.Element })
+			end)
+			chip.InputBegan:Connect(function(input)
+				if isPress(input) and not drag then
+					drag = { action = a, start = pointer(input), active = false, ghost = nil }
+				end
+			end)
+		end
+
+		for _, a in ipairs(o.Actions or {}) do
+			api:AddAction(a)
+		end
+
+		return api
 	end
 
 	return Window
@@ -1220,6 +2013,10 @@ function Library:Unload()
 		end)
 	end
 	self._connections = {}
+	restoreCursor()
+	self._cursorStarted = false
+	self._windows = {}
+	self.Flags = {}
 	if self.Gui then
 		self.Gui:Destroy()
 		self.Gui = nil
